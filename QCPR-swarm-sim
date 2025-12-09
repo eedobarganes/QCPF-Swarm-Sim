@@ -1,0 +1,460 @@
+import tkinter as tk
+from tkinter import ttk
+import numpy as np
+import math
+import random
+import time
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+WIDTH, HEIGHT = 900, 700
+NUM_AGENTS = 25
+NUM_HAZARDS = 6
+NUM_FOOD = 20
+AGENT_RADIUS = 8  # Slightly smaller head to emphasize tail
+TAIL_LENGTH = 12  # Number of segments in the tail
+MAX_SPEED = 4.0  # Faster to make the tail movement look better
+SENSOR_RANGE = 200.0
+
+
+# ==========================================
+# MATH UTILS
+# ==========================================
+def normalize(v):
+    norm = np.linalg.norm(v)
+    if norm == 0: return v
+    return v / norm
+
+
+def dist_sq(a, b):
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+# ==========================================
+# PART 1: THE AGENT (GAMETE STYLE)
+# ==========================================
+class OrganicAgent:
+    def __init__(self, uid, x, y):
+        self.id = uid
+        self.pos = np.array([float(x), float(y)])
+        self.vel = np.array([random.uniform(-1, 1), random.uniform(-1, 1)])
+        self.acc = np.array([0.0, 0.0])
+
+        self.color = "#0088AA"
+
+        # Tail Physics
+        self.trail = []
+        self.max_trail = TAIL_LENGTH
+
+        # IIQC State
+        self.phi = 0.0
+        self.is_conscious = False
+
+        # Survival State
+        self.energy = 1.0
+        self.alive = True
+        self.age = 0
+
+        # Inputs from GUI
+        self.focus = 0.5
+        self.noise_level = 0.1
+        self.phi_threshold = 0.5
+
+    def update_physics(self):
+        if not self.alive: return
+
+        self.age += 1
+
+        # 1. Update Tail (Store current position before moving)
+        self.trail.append(tuple(self.pos))
+        if len(self.trail) > self.max_trail:
+            self.trail.pop(0)
+
+        # 2. Update Motion
+        self.vel += self.acc
+
+        # Environment Noise
+        if self.noise_level > 0:
+            jitter = np.random.normal(0, self.noise_level * 2.0, 2)
+            self.vel += jitter
+
+        # Cap speed
+        speed = np.linalg.norm(self.vel)
+        if speed > MAX_SPEED:
+            self.vel = (self.vel / speed) * MAX_SPEED
+
+        self.pos += self.vel
+        self.vel *= 0.92  # Friction
+        self.acc *= 0
+
+        # Boundary Wrap (Teleporting clears trail to avoid streaks across screen)
+        wrapped = False
+        if self.pos[0] > WIDTH:
+            self.pos[0] = 0
+            wrapped = True
+        if self.pos[0] < 0:
+            self.pos[0] = WIDTH
+            wrapped = True
+        if self.pos[1] > HEIGHT:
+            self.pos[1] = 0
+            wrapped = True
+        if self.pos[1] < 0:
+            self.pos[1] = HEIGHT
+            wrapped = True
+
+        if wrapped:
+            self.trail = []  # Clear trail on teleport so it doesn't stretch
+
+        # Metabolic cost
+        burn_rate = 0.002 + (self.focus * 0.002) if self.is_conscious else 0.002
+        self.energy -= burn_rate
+        if self.energy <= 0:
+            self.alive = False
+
+    def sense_and_decide(self, hazards, foods):
+        if not self.alive: return
+
+        # --- SENSE ---
+        closest_food = None
+        closest_food_dist = 99999
+        closest_haz = None
+        closest_haz_dist = 99999
+
+        for f in foods:
+            if not f.active: continue
+            d2 = dist_sq(self.pos, f.pos)
+            if d2 < SENSOR_RANGE ** 2 and d2 < closest_food_dist:
+                closest_food_dist = d2
+                closest_food = f
+
+        for h in hazards:
+            d2 = dist_sq(self.pos, h.pos)
+            if d2 < SENSOR_RANGE ** 2 and d2 < closest_haz_dist:
+                closest_haz_dist = d2
+                closest_haz = h
+
+        # --- INTEGRATE (Phi) ---
+        input_strength = 0.0
+        if closest_food: input_strength += 0.5
+        if closest_haz: input_strength += 0.5
+
+        integration_quality = 1.0 - (self.noise_level * 2.0)
+        integration_quality = max(0, integration_quality)
+
+        self.phi = input_strength * integration_quality
+        self.phi += random.uniform(-0.1, 0.1)
+        self.phi = np.clip(self.phi, 0, 1)
+
+        self.is_conscious = self.phi > self.phi_threshold
+
+        # --- ACT (Intention) ---
+        force = np.array([0.0, 0.0])
+
+        if self.is_conscious:
+            # === CONSCIOUS (Gold) ===
+            self.color = "#FFD700"
+
+            if closest_food:
+                vec = closest_food.pos - self.pos
+                force += normalize(vec) * (1.0 + self.focus * 2.0)
+
+            if closest_haz:
+                vec = self.pos - closest_haz.pos
+                dist = math.sqrt(closest_haz_dist)
+                urgency = (SENSOR_RANGE - dist) / SENSOR_RANGE
+                force += normalize(vec) * (urgency * 4.0)
+
+            wander_strength = 0.5 * (1.0 - self.focus)
+            wander = np.array([random.uniform(-1, 1), random.uniform(-1, 1)])
+            force += wander * wander_strength
+
+        else:
+            # === ZOMBIE (Blue) ===
+            self.color = "#0088AA"
+
+            wander = np.array([random.uniform(-1, 1), random.uniform(-1, 1)])
+            force += wander * 1.5
+
+            if closest_food:
+                vec = closest_food.pos - self.pos
+                force += normalize(vec) * 0.2
+
+        self.acc += force * 0.5
+
+
+# ==========================================
+# PART 2: ENVIRONMENT
+# ==========================================
+class Hazard:
+    def __init__(self):
+        self.pos = np.array([random.uniform(0, WIDTH), random.uniform(0, HEIGHT)])
+        self.vel = np.array([random.uniform(-0.8, 0.8), random.uniform(-0.8, 0.8)])
+        self.radius = random.randint(30, 50)
+
+    def move(self):
+        self.pos += self.vel
+        if self.pos[0] < 0 or self.pos[0] > WIDTH: self.vel[0] *= -1
+        if self.pos[1] < 0 or self.pos[1] > HEIGHT: self.vel[1] *= -1
+
+
+class Food:
+    def __init__(self):
+        self.pos = np.array([random.uniform(0, WIDTH), random.uniform(0, HEIGHT)])
+        self.active = True
+        self.radius = 6
+
+
+class Environment:
+    def __init__(self):
+        self.agents = [OrganicAgent(i, random.uniform(0, WIDTH), random.uniform(0, HEIGHT)) for i in range(NUM_AGENTS)]
+        self.hazards = [Hazard() for _ in range(NUM_HAZARDS)]
+        self.foods = [Food() for _ in range(NUM_FOOD)]
+        self.death_ages = []
+
+    def update(self, params):
+        for h in self.hazards: h.move()
+
+        for agent in self.agents:
+            if not agent.alive: continue
+
+            agent.phi_threshold = params['phi_thresh']
+            agent.focus = params['focus']
+            agent.noise_level = params['noise']
+
+            agent.sense_and_decide(self.hazards, self.foods)
+            agent.update_physics()
+
+            died = False
+            for h in self.hazards:
+                if dist_sq(agent.pos, h.pos) < (h.radius + AGENT_RADIUS) ** 2:
+                    died = True
+
+            for f in self.foods:
+                if f.active and dist_sq(agent.pos, f.pos) < (f.radius + AGENT_RADIUS + 5) ** 2:
+                    f.active = False
+                    agent.energy = min(1.0, agent.energy + 0.5)
+
+            if died or not agent.alive:
+                agent.alive = False
+                self.death_ages.append(agent.age)
+                if len(self.death_ages) > 200: self.death_ages.pop(0)
+
+        # Respawn Food
+        if random.random() < 0.1:
+            dead_foods = [f for f in self.foods if not f.active]
+            if dead_foods:
+                f = random.choice(dead_foods)
+                f.active = True
+                f.pos = np.array([random.uniform(0, WIDTH), random.uniform(0, HEIGHT)])
+
+        # Respawn Agents
+        if random.random() < 0.05:
+            dead_agents = [a for a in self.agents if not a.alive]
+            if dead_agents:
+                a = dead_agents[0]
+                a.alive = True
+                a.age = 0
+                a.trail = []
+                a.pos = np.array([random.uniform(0, WIDTH), random.uniform(0, HEIGHT)])
+                a.energy = 1.0
+                a.vel *= 0
+
+
+# ==========================================
+# PART 3: GUI
+# ==========================================
+class GameteSimApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("IIQC Gamete Simulator")
+        self.root.geometry(f"{WIDTH + 350}x{HEIGHT + 20}")
+        self.root.configure(bg="#050505")
+
+        self.env = Environment()
+
+        self.canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT, bg="#000000", highlightthickness=0)
+        self.canvas.pack(side=tk.LEFT, padx=10, pady=10)
+
+        self.sidebar = tk.Frame(root, bg="#111", width=330)
+        self.sidebar.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.sidebar.pack_propagate(False)
+
+        self.setup_controls()
+        self.loop()
+
+    def setup_controls(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("TScale", background="#111", troughcolor="#333", sliderlength=20)
+        pad = {'padx': 15, 'pady': 5}
+
+        tk.Label(self.sidebar, text="IIQC MASTER CONTROL", bg="#111", fg="#00FFFF", font=("Segoe UI", 14, "bold")).pack(
+            pady=10)
+
+        tk.Label(self.sidebar, text="Live Consciousness (Φ)", bg="#111", fg="#ddd", font=("Segoe UI", 9)).pack(
+            pady=(5, 0))
+        self.phi_canvas = tk.Canvas(self.sidebar, bg="#000", height=80, width=280, highlightthickness=1,
+                                    highlightbackground="#333")
+        self.phi_canvas.pack(pady=5)
+
+        tk.Label(self.sidebar, text="Lifetime History (Age at Death)", bg="#111", fg="#ddd", font=("Segoe UI", 9)).pack(
+            pady=(5, 0))
+        self.life_canvas = tk.Canvas(self.sidebar, bg="#000", height=80, width=280, highlightthickness=1,
+                                     highlightbackground="#333")
+        self.life_canvas.pack(pady=5)
+
+        tk.Label(self.sidebar, text="Φ Threshold (Wake Up)", bg="#111", fg="#aaa").pack(anchor='w', padx=15)
+        self.var_thresh = tk.DoubleVar(value=0.5)
+        ttk.Scale(self.sidebar, from_=0.0, to=1.0, variable=self.var_thresh).pack(fill='x', **pad)
+
+        tk.Label(self.sidebar, text="Intentional Focus", bg="#111", fg="#aaa").pack(anchor='w', padx=15)
+        self.var_focus = tk.DoubleVar(value=0.5)
+        ttk.Scale(self.sidebar, from_=0.0, to=1.0, variable=self.var_focus).pack(fill='x', **pad)
+
+        tk.Label(self.sidebar, text="Entropy / Noise", bg="#111", fg="#aaa").pack(anchor='w', padx=15)
+        self.var_noise = tk.DoubleVar(value=0.1)
+        ttk.Scale(self.sidebar, from_=0.0, to=0.5, variable=self.var_noise).pack(fill='x', **pad)
+
+        ttk.Separator(self.sidebar, orient='horizontal').pack(fill='x', pady=15)
+
+        self.legend_canvas = tk.Canvas(self.sidebar, bg="#111", height=100, highlightthickness=0)
+        self.legend_canvas.pack(fill='x', padx=15)
+        self.draw_legend()
+
+    def draw_legend(self):
+        c = self.legend_canvas
+        c.create_oval(10, 10, 25, 25, fill="#00FF00", outline="#AAFFAA")
+        c.create_text(35, 18, text="Food", fill="#ddd", anchor="w")
+
+        c.create_oval(10, 35, 25, 50, fill="#AA0000", outline="#FF0000")
+        c.create_text(35, 43, text="Hazard", fill="#ddd", anchor="w")
+
+        # Gamete Icon for Legend
+        c.create_oval(10, 60, 25, 75, fill="#FFD700")
+        c.create_line(10, 67, 0, 67, width=3, fill="#FFD700", capstyle='round')
+        c.create_text(35, 68, text="Conscious Agent", fill="#FFD700", anchor="w")
+
+    def draw_phi_histogram(self):
+        self.phi_canvas.delete("all")
+        w, h = 280, 80
+        phis = [a.phi for a in self.env.agents if a.alive]
+        if not phis: return
+
+        counts, _ = np.histogram(phis, bins=10, range=(0.0, 1.0))
+        max_count = np.max(counts) if np.max(counts) > 0 else 1
+        bar_w = w / 10
+
+        for i, count in enumerate(counts):
+            bar_h = (count / max_count) * (h - 5)
+            x1 = i * bar_w
+            y1 = h - bar_h
+            mid_val = (i / 10) + 0.05
+            color = "#FFD700" if mid_val > self.var_thresh.get() else "#0088AA"
+            self.phi_canvas.create_rectangle(x1, y1, x1 + bar_w - 1, h, fill=color, outline="")
+
+        tx = self.var_thresh.get() * w
+        self.phi_canvas.create_line(tx, 0, tx, h, fill="white", dash=(2, 2))
+
+    def draw_life_histogram(self):
+        self.life_canvas.delete("all")
+        w, h = 280, 80
+        ages = self.env.death_ages
+        if not ages:
+            self.life_canvas.create_text(w / 2, h / 2, text="No data yet...", fill="#555")
+            return
+
+        max_age = max(ages)
+        if max_age < 100: max_age = 100
+
+        counts, _ = np.histogram(ages, bins=20, range=(0, max_age))
+        max_count = np.max(counts) if np.max(counts) > 0 else 1
+        bar_w = w / 20
+
+        for i, count in enumerate(counts):
+            bar_h = (count / max_count) * (h - 5)
+            x1 = i * bar_w
+            y1 = h - bar_h
+            intensity = int((i / 20) * 255)
+            color = f'#{255 - intensity:02x}{intensity:02x}{intensity:02x}'
+            self.life_canvas.create_rectangle(x1, y1, x1 + bar_w - 1, h, fill=color, outline="")
+
+    def draw_sim(self):
+        self.canvas.delete("all")
+
+        # Hazards
+        t = time.time()
+        for h in self.env.hazards:
+            pulse = math.sin(t * 4) * 3
+            r = h.radius + pulse
+            self.canvas.create_oval(h.pos[0] - r, h.pos[1] - r, h.pos[0] + r, h.pos[1] + r, fill="#220000",
+                                    outline="#880000", width=2)
+
+        # Food
+        for f in self.env.foods:
+            if f.active:
+                r = f.radius
+                self.canvas.create_oval(f.pos[0] - r, f.pos[1] - r, f.pos[0] + r, f.pos[1] + r, fill="#00FF00",
+                                        outline="#AAFFAA")
+
+        # Agents
+        for a in self.env.agents:
+            if not a.alive:
+                self.canvas.create_text(a.pos[0], a.pos[1], text="x", fill="#333")
+                continue
+
+            # --- DRAW TAIL (Gamete Effect) ---
+            if len(a.trail) > 1:
+                # We draw segments from the Tip (index 0) to the Head (index -1)
+                # The width increases as we get closer to the head
+                for i in range(len(a.trail) - 1):
+                    x1, y1 = a.trail[i]
+                    x2, y2 = a.trail[i + 1]
+
+                    # Tapering calculation
+                    # i=0 (Tip) -> width small
+                    # i=max (Neck) -> width ~ Agent Radius
+                    pct = (i + 1) / len(a.trail)
+                    width = pct * (AGENT_RADIUS * 1.5)
+
+                    self.canvas.create_line(x1, y1, x2, y2, fill=a.color, width=width, capstyle='round')
+
+            # --- DRAW HEAD ---
+            r = AGENT_RADIUS
+            self.canvas.create_oval(a.pos[0] - r, a.pos[1] - r, a.pos[0] + r, a.pos[1] + r, fill=a.color, outline="")
+
+            # Energy Bar
+            e_len = (r * 2) * a.energy
+            ec = "#00FF00" if a.energy > 0.3 else "#FF0000"
+            self.canvas.create_line(a.pos[0] - r, a.pos[1] - r - 5, a.pos[0] - r + e_len, a.pos[1] - r - 5, fill=ec,
+                                    width=2)
+
+    def loop(self):
+        start = time.time()
+
+        params = {
+            'phi_thresh': self.var_thresh.get(),
+            'focus': self.var_focus.get(),
+            'noise': self.var_noise.get()
+        }
+
+        self.env.update(params)
+        self.draw_sim()
+        self.draw_phi_histogram()
+        self.draw_life_histogram()
+
+        elapsed = time.time() - start
+        wait = max(10, int((1.0 / 40.0 - elapsed) * 1000))
+        self.root.after(wait, self.loop)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    try:
+        from ctypes import windll
+
+        windll.shcore.SetProcessDpiAwareness(1)
+    except:
+        pass
+    app = GameteSimApp(root)
+    root.mainloop()
